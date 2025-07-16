@@ -4,10 +4,13 @@
 (define-constant ERR-INSUFFICIENT-FUNDS (err u103))
 (define-constant ERR-PROOF-REQUIRED (err u104))
 (define-constant ERR-ALREADY-CLAIMED (err u105))
+(define-constant ERR-ALREADY-VOTED (err u106))
+(define-constant ERR-INSUFFICIENT-VERIFICATIONS (err u107))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-trees-planted uint u0)
 (define-data-var bounty-counter uint u0)
+(define-data-var min-verifications uint u3)
 
 (define-map bounties
     uint
@@ -34,6 +37,19 @@
         photo-hash: (string-utf8 64),
         verified: bool,
         claimed: bool,
+        verification-count: uint,
+    }
+)
+
+(define-map community-verifications
+    {
+        bounty-id: uint,
+        planter: principal,
+        verifier: principal,
+    }
+    {
+        vote: bool,
+        block-height: uint,
     }
 )
 
@@ -66,6 +82,18 @@
     }
         (map-get? planter-stats planter)
     )
+)
+
+(define-read-only (get-community-verification
+        (bounty-id uint)
+        (planter principal)
+        (verifier principal)
+    )
+    (map-get? community-verifications {
+        bounty-id: bounty-id,
+        planter: planter,
+        verifier: verifier,
+    })
 )
 
 (define-public (create-bounty
@@ -114,8 +142,82 @@
             photo-hash: photo-hash,
             verified: false,
             claimed: false,
+            verification-count: u0,
         })
         (ok true)
+    )
+)
+
+(define-public (community-verify-tree
+        (bounty-id uint)
+        (planter principal)
+        (vote bool)
+    )
+    (let (
+            (proof (unwrap!
+                (map-get? tree-proofs {
+                    bounty-id: bounty-id,
+                    planter: planter,
+                })
+                (err ERR-PROOF-REQUIRED)
+            ))
+            (existing-vote (map-get? community-verifications {
+                bounty-id: bounty-id,
+                planter: planter,
+                verifier: tx-sender,
+            }))
+            (current-count (get verification-count proof))
+            (new-count (if vote
+                (+ current-count u1)
+                current-count
+            ))
+        )
+        (asserts! (is-none existing-vote) (err ERR-ALREADY-VOTED))
+        (asserts! (not (is-eq tx-sender planter)) (err ERR-NOT-AUTHORIZED))
+        (map-set community-verifications {
+            bounty-id: bounty-id,
+            planter: planter,
+            verifier: tx-sender,
+        } {
+            vote: vote,
+            block-height: burn-block-height,
+        })
+        (if vote
+            (begin
+                (map-set tree-proofs {
+                    bounty-id: bounty-id,
+                    planter: planter,
+                }
+                    (merge proof { verification-count: new-count })
+                )
+                (if (>= new-count (var-get min-verifications))
+                    (begin
+                        (map-set tree-proofs {
+                            bounty-id: bounty-id,
+                            planter: planter,
+                        }
+                            (merge proof {
+                                verification-count: new-count,
+                                verified: true,
+                            })
+                        )
+                        (let ((bounty (unwrap! (map-get? bounties bounty-id)
+                                (err ERR-BOUNTY-NOT-FOUND)
+                            )))
+                            (map-set bounties bounty-id
+                                (merge bounty { trees-planted: (+ (get trees-planted bounty) u1) })
+                            )
+                            (var-set total-trees-planted
+                                (+ (var-get total-trees-planted) u1)
+                            )
+                            (ok true)
+                        )
+                    )
+                    (ok true)
+                )
+            )
+            (ok true)
+        )
     )
 )
 (define-public (verify-tree-proof
@@ -139,7 +241,10 @@
             bounty-id: bounty-id,
             planter: planter,
         }
-            (merge proof { verified: true })
+            (merge proof {
+                verified: true,
+                verification-count: u1,
+            })
         )
         (map-set bounties bounty-id
             (merge bounty { trees-planted: (+ (get trees-planted bounty) u1) })
