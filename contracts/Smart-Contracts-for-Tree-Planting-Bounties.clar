@@ -11,6 +11,8 @@
 (define-data-var total-trees-planted uint u0)
 (define-data-var bounty-counter uint u0)
 (define-data-var min-verifications uint u3)
+(define-data-var base-reputation uint u100)
+(define-data-var max-reputation uint u1000)
 
 (define-map bounties
     uint
@@ -61,6 +63,16 @@
     }
 )
 
+(define-map user-reputation
+    principal
+    {
+        score: uint,
+        correct-verifications: uint,
+        total-verifications: uint,
+        last-updated: uint,
+    }
+)
+
 (define-read-only (get-bounty (bounty-id uint))
     (ok (unwrap! (map-get? bounties bounty-id) ERR-BOUNTY-NOT-FOUND))
 )
@@ -81,6 +93,23 @@
         total-rewards: u0,
     }
         (map-get? planter-stats planter)
+    )
+)
+
+(define-read-only (get-user-reputation (user principal))
+    (default-to {
+        score: (var-get base-reputation),
+        correct-verifications: u0,
+        total-verifications: u0,
+        last-updated: u0,
+    }
+        (map-get? user-reputation user)
+    )
+)
+
+(define-read-only (calculate-reputation-weight (user principal))
+    (let ((reputation (get-user-reputation user)))
+        (/ (get score reputation) (var-get base-reputation))
     )
 )
 
@@ -167,10 +196,12 @@
                 verifier: tx-sender,
             }))
             (current-count (get verification-count proof))
-            (new-count (if vote
-                (+ current-count u1)
-                current-count
+            (verifier-weight (calculate-reputation-weight tx-sender))
+            (weighted-vote (if vote
+                verifier-weight
+                u0
             ))
+            (new-count (+ current-count weighted-vote))
         )
         (asserts! (is-none existing-vote) (err ERR-ALREADY-VOTED))
         (asserts! (not (is-eq tx-sender planter)) (err ERR-NOT-AUTHORIZED))
@@ -182,44 +213,101 @@
             vote: vote,
             block-height: burn-block-height,
         })
-        (if vote
-            (begin
-                (map-set tree-proofs {
-                    bounty-id: bounty-id,
-                    planter: planter,
-                }
-                    (merge proof { verification-count: new-count })
-                )
-                (if (>= new-count (var-get min-verifications))
-                    (begin
-                        (map-set tree-proofs {
-                            bounty-id: bounty-id,
-                            planter: planter,
-                        }
-                            (merge proof {
-                                verification-count: new-count,
-                                verified: true,
-                            })
-                        )
-                        (let ((bounty (unwrap! (map-get? bounties bounty-id)
-                                (err ERR-BOUNTY-NOT-FOUND)
-                            )))
-                            (map-set bounties bounty-id
-                                (merge bounty { trees-planted: (+ (get trees-planted bounty) u1) })
-                            )
-                            (var-set total-trees-planted
-                                (+ (var-get total-trees-planted) u1)
-                            )
-                            (ok true)
-                        )
+        (begin
+            (unwrap-panic (update-verifier-reputation tx-sender vote))
+            (if vote
+                (begin
+                    (map-set tree-proofs {
+                        bounty-id: bounty-id,
+                        planter: planter,
+                    }
+                        (merge proof { verification-count: new-count })
                     )
-                    (ok true)
+                    (if (>= new-count
+                            (* (var-get min-verifications)
+                                (var-get base-reputation)
+                            ))
+                        (begin
+                            (map-set tree-proofs {
+                                bounty-id: bounty-id,
+                                planter: planter,
+                            }
+                                (merge proof {
+                                    verification-count: new-count,
+                                    verified: true,
+                                })
+                            )
+                            (let ((bounty (unwrap! (map-get? bounties bounty-id)
+                                    (err ERR-BOUNTY-NOT-FOUND)
+                                )))
+                                (map-set bounties bounty-id
+                                    (merge bounty { trees-planted: (+ (get trees-planted bounty) u1) })
+                                )
+                                (var-set total-trees-planted
+                                    (+ (var-get total-trees-planted) u1)
+                                )
+                                (ok true)
+                            )
+                        )
+                        (ok true)
+                    )
                 )
+                (ok true)
             )
-            (ok true)
         )
     )
 )
+
+(define-private (update-verifier-reputation
+        (verifier principal)
+        (correct-vote bool)
+    )
+    (let (
+            (current-rep (get-user-reputation verifier))
+            (new-total-verifications (+ (get total-verifications current-rep) u1))
+            (new-correct-verifications (if correct-vote
+                (+ (get correct-verifications current-rep) u1)
+                (get correct-verifications current-rep)
+            ))
+            (accuracy-rate (if (> new-total-verifications u0)
+                (/ (* new-correct-verifications u100) new-total-verifications)
+                u50
+            ))
+            (reputation-adjustment (if (> accuracy-rate u75)
+                u10
+                (if (< accuracy-rate u25)
+                    u20
+                    u0
+                )
+            ))
+            (new-score (if (> accuracy-rate u75)
+                (let ((proposed-score (+ (get score current-rep) reputation-adjustment)))
+                    (if (> proposed-score (var-get max-reputation))
+                        (var-get max-reputation)
+                        proposed-score
+                    )
+                )
+                (if (< accuracy-rate u25)
+                    (let ((proposed-score (- (get score current-rep) reputation-adjustment)))
+                        (if (< proposed-score u10)
+                            u10
+                            proposed-score
+                        )
+                    )
+                    (get score current-rep)
+                )
+            ))
+        )
+        (map-set user-reputation verifier {
+            score: new-score,
+            correct-verifications: new-correct-verifications,
+            total-verifications: new-total-verifications,
+            last-updated: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
 (define-public (verify-tree-proof
         (bounty-id uint)
         (planter principal)
