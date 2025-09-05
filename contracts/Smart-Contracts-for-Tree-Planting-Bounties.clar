@@ -6,6 +6,7 @@
 (define-constant ERR-ALREADY-CLAIMED (err u105))
 (define-constant ERR-ALREADY-VOTED (err u106))
 (define-constant ERR-INSUFFICIENT-VERIFICATIONS (err u107))
+(define-constant ERR-SPECIES-NOT-FOUND (err u108))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-trees-planted uint u0)
@@ -13,6 +14,9 @@
 (define-data-var min-verifications uint u3)
 (define-data-var base-reputation uint u100)
 (define-data-var max-reputation uint u1000)
+(define-data-var total-co2-absorbed uint u0)
+(define-data-var total-oxygen-produced uint u0)
+(define-data-var total-soil-improved uint u0)
 
 (define-map bounties
     uint
@@ -40,6 +44,8 @@
         verified: bool,
         claimed: bool,
         verification-count: uint,
+        species: (string-utf8 32),
+        region: (string-utf8 32),
     }
 )
 
@@ -70,6 +76,25 @@
         correct-verifications: uint,
         total-verifications: uint,
         last-updated: uint,
+    }
+)
+
+(define-map tree-species
+    (string-utf8 32)
+    {
+        co2-per-year: uint,
+        oxygen-per-year: uint,
+        soil-improvement: uint,
+    }
+)
+
+(define-map regional-impact
+    (string-utf8 32)
+    {
+        trees-count: uint,
+        co2-absorbed: uint,
+        oxygen-produced: uint,
+        soil-improved: uint,
     }
 )
 
@@ -125,6 +150,30 @@
     })
 )
 
+(define-read-only (get-tree-species (species (string-utf8 32)))
+    (map-get? tree-species species)
+)
+
+(define-read-only (get-regional-impact (region (string-utf8 32)))
+    (default-to {
+        trees-count: u0,
+        co2-absorbed: u0,
+        oxygen-produced: u0,
+        soil-improved: u0,
+    }
+        (map-get? regional-impact region)
+    )
+)
+
+(define-read-only (get-total-environmental-impact)
+    {
+        total-trees: (var-get total-trees-planted),
+        total-co2-absorbed: (var-get total-co2-absorbed),
+        total-oxygen-produced: (var-get total-oxygen-produced),
+        total-soil-improved: (var-get total-soil-improved),
+    }
+)
+
 (define-public (create-bounty
         (reward-per-tree uint)
         (trees-required uint)
@@ -155,6 +204,8 @@
         (gps-lat (string-utf8 50))
         (gps-long (string-utf8 50))
         (photo-hash (string-utf8 64))
+        (species (string-utf8 32))
+        (region (string-utf8 32))
     )
     (let (
             (bounty (unwrap! (map-get? bounties bounty-id) (err ERR-BOUNTY-NOT-FOUND)))
@@ -162,6 +213,9 @@
         )
         (asserts! (< current-height (get expiry bounty)) (err ERR-INVALID-BOUNTY))
         (asserts! (get active bounty) (err ERR-INVALID-BOUNTY))
+        (asserts! (is-some (map-get? tree-species species))
+            (err ERR-SPECIES-NOT-FOUND)
+        )
         (map-set tree-proofs {
             bounty-id: bounty-id,
             planter: tx-sender,
@@ -172,6 +226,8 @@
             verified: false,
             claimed: false,
             verification-count: u0,
+            species: species,
+            region: region,
         })
         (ok true)
     )
@@ -240,13 +296,19 @@
                             (let ((bounty (unwrap! (map-get? bounties bounty-id)
                                     (err ERR-BOUNTY-NOT-FOUND)
                                 )))
-                                (map-set bounties bounty-id
-                                    (merge bounty { trees-planted: (+ (get trees-planted bounty) u1) })
+                                (begin
+                                    (unwrap-panic (update-environmental-impact
+                                        (get species proof)
+                                        (get region proof)
+                                    ))
+                                    (map-set bounties bounty-id
+                                        (merge bounty { trees-planted: (+ (get trees-planted bounty) u1) })
+                                    )
+                                    (var-set total-trees-planted
+                                        (+ (var-get total-trees-planted) u1)
+                                    )
+                                    (ok true)
                                 )
-                                (var-set total-trees-planted
-                                    (+ (var-get total-trees-planted) u1)
-                                )
-                                (ok true)
                             )
                         )
                         (ok true)
@@ -334,11 +396,14 @@
                 verification-count: u1,
             })
         )
-        (map-set bounties bounty-id
-            (merge bounty { trees-planted: (+ (get trees-planted bounty) u1) })
+        (begin
+            (unwrap-panic (update-environmental-impact (get species proof) (get region proof)))
+            (map-set bounties bounty-id
+                (merge bounty { trees-planted: (+ (get trees-planted bounty) u1) })
+            )
+            (var-set total-trees-planted (+ (var-get total-trees-planted) u1))
+            (ok true)
         )
-        (var-set total-trees-planted (+ (var-get total-trees-planted) u1))
-        (ok true)
     )
 )
 (define-public (claim-reward (bounty-id uint))
@@ -405,5 +470,52 @@
             )
             error (err ERR-INSUFFICIENT-FUNDS)
         )
+    )
+)
+
+(define-private (update-environmental-impact
+        (species (string-utf8 32))
+        (region (string-utf8 32))
+    )
+    (let (
+            (species-data (unwrap! (map-get? tree-species species) (err ERR-SPECIES-NOT-FOUND)))
+            (current-regional (get-regional-impact region))
+            (co2-impact (get co2-per-year species-data))
+            (oxygen-impact (get oxygen-per-year species-data))
+            (soil-impact (get soil-improvement species-data))
+        )
+        (var-set total-co2-absorbed (+ (var-get total-co2-absorbed) co2-impact))
+        (var-set total-oxygen-produced
+            (+ (var-get total-oxygen-produced) oxygen-impact)
+        )
+        (var-set total-soil-improved
+            (+ (var-get total-soil-improved) soil-impact)
+        )
+        (map-set regional-impact region {
+            trees-count: (+ (get trees-count current-regional) u1),
+            co2-absorbed: (+ (get co2-absorbed current-regional) co2-impact),
+            oxygen-produced: (+ (get oxygen-produced current-regional) oxygen-impact),
+            soil-improved: (+ (get soil-improved current-regional) soil-impact),
+        })
+        (ok true)
+    )
+)
+
+(define-public (register-tree-species
+        (species (string-utf8 32))
+        (co2-per-year uint)
+        (oxygen-per-year uint)
+        (soil-improvement uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner))
+            (err ERR-NOT-AUTHORIZED)
+        )
+        (map-set tree-species species {
+            co2-per-year: co2-per-year,
+            oxygen-per-year: oxygen-per-year,
+            soil-improvement: soil-improvement,
+        })
+        (ok true)
     )
 )
