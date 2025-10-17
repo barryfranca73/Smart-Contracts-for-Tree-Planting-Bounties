@@ -7,6 +7,8 @@
 (define-constant ERR-ALREADY-VOTED (err u106))
 (define-constant ERR-INSUFFICIENT-VERIFICATIONS (err u107))
 (define-constant ERR-SPECIES-NOT-FOUND (err u108))
+(define-constant ERR-INSUFFICIENT-MATCHING-FUNDS (err u109))
+(define-constant ERR-NO-MATCHING-PLEDGE (err u110))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-trees-planted uint u0)
@@ -98,6 +100,26 @@
     }
 )
 
+(define-map sponsor-matches
+    {
+        bounty-id: uint,
+        sponsor: principal,
+    }
+    {
+        pledged-amount: uint,
+        remaining-amount: uint,
+        match-ratio: uint,
+    }
+)
+
+(define-map bounty-total-matches
+    uint
+    {
+        total-pledged: uint,
+        total-remaining: uint,
+    }
+)
+
 (define-read-only (get-bounty (bounty-id uint))
     (ok (unwrap! (map-get? bounties bounty-id) ERR-BOUNTY-NOT-FOUND))
 )
@@ -172,6 +194,25 @@
         total-oxygen-produced: (var-get total-oxygen-produced),
         total-soil-improved: (var-get total-soil-improved),
     }
+)
+
+(define-read-only (get-sponsor-match
+        (bounty-id uint)
+        (sponsor principal)
+    )
+    (map-get? sponsor-matches {
+        bounty-id: bounty-id,
+        sponsor: sponsor,
+    })
+)
+
+(define-read-only (get-bounty-matching-pool (bounty-id uint))
+    (default-to {
+        total-pledged: u0,
+        total-remaining: u0,
+    }
+        (map-get? bounty-total-matches bounty-id)
+    )
 )
 
 (define-public (create-bounty
@@ -423,15 +464,30 @@
                 (map-get? planter-stats tx-sender)
             ))
             (reward (get reward-per-tree bounty))
+            (matching-pool (get-bounty-matching-pool bounty-id))
+            (available-match (get total-remaining matching-pool))
+            (match-amount (if (> available-match u0)
+                reward
+                u0
+            ))
+            (total-payout (+ reward match-amount))
         )
         (asserts! (get verified proof) (err ERR-PROOF-REQUIRED))
         (asserts! (not (get claimed proof)) (err ERR-ALREADY-CLAIMED))
         (asserts! (<= reward (get remaining-reward bounty))
             (err ERR-INSUFFICIENT-FUNDS)
         )
-        (let ((transfer-result (stx-transfer? reward (as-contract tx-sender) tx-sender)))
-            (match transfer-result
+        (let ((base-transfer (stx-transfer? reward (as-contract tx-sender) tx-sender)))
+            (match base-transfer
                 success (begin
+                    (if (> match-amount u0)
+                        (begin
+                            (unwrap-panic (as-contract (stx-transfer? match-amount tx-sender tx-sender)))
+                            (unwrap-panic (distribute-matching-funds bounty-id match-amount))
+                            true
+                        )
+                        true
+                    )
                     (map-set tree-proofs {
                         bounty-id: bounty-id,
                         planter: tx-sender,
@@ -443,7 +499,7 @@
                     )
                     (map-set planter-stats tx-sender {
                         total-trees: (+ (get total-trees stats) u1),
-                        total-rewards: (+ (get total-rewards stats) reward),
+                        total-rewards: (+ (get total-rewards stats) total-payout),
                     })
                     (ok true)
                 )
@@ -515,6 +571,88 @@
             co2-per-year: co2-per-year,
             oxygen-per-year: oxygen-per-year,
             soil-improvement: soil-improvement,
+        })
+        (ok true)
+    )
+)
+
+(define-public (pledge-matching-funds
+        (bounty-id uint)
+        (amount uint)
+        (match-ratio uint)
+    )
+    (let (
+            (bounty (unwrap! (map-get? bounties bounty-id) ERR-BOUNTY-NOT-FOUND))
+            (current-pool (get-bounty-matching-pool bounty-id))
+        )
+        (asserts! (get active bounty) ERR-INVALID-BOUNTY)
+        (asserts! (> amount u0) ERR-INSUFFICIENT-FUNDS)
+        (asserts! (> match-ratio u0) ERR-INVALID-BOUNTY)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (map-set sponsor-matches {
+            bounty-id: bounty-id,
+            sponsor: tx-sender,
+        } {
+            pledged-amount: amount,
+            remaining-amount: amount,
+            match-ratio: match-ratio,
+        })
+        (map-set bounty-total-matches bounty-id {
+            total-pledged: (+ (get total-pledged current-pool) amount),
+            total-remaining: (+ (get total-remaining current-pool) amount),
+        })
+        (ok true)
+    )
+)
+
+(define-public (withdraw-matching-funds (bounty-id uint))
+    (let (
+            (sponsor-match (unwrap!
+                (map-get? sponsor-matches {
+                    bounty-id: bounty-id,
+                    sponsor: tx-sender,
+                })
+                (err ERR-NO-MATCHING-PLEDGE)
+            ))
+            (remaining (get remaining-amount sponsor-match))
+            (current-pool (get-bounty-matching-pool bounty-id))
+        )
+        (asserts! (> remaining u0) (err ERR-INSUFFICIENT-FUNDS))
+        (match (as-contract (stx-transfer? remaining tx-sender tx-sender))
+            success (begin
+                (map-set sponsor-matches {
+                    bounty-id: bounty-id,
+                    sponsor: tx-sender,
+                } {
+                    pledged-amount: (get pledged-amount sponsor-match),
+                    remaining-amount: u0,
+                    match-ratio: (get match-ratio sponsor-match),
+                })
+                (map-set bounty-total-matches bounty-id {
+                    total-pledged: (get total-pledged current-pool),
+                    total-remaining: (- (get total-remaining current-pool) remaining),
+                })
+                (ok true)
+            )
+            error (err ERR-INSUFFICIENT-FUNDS)
+        )
+    )
+)
+
+(define-private (distribute-matching-funds
+        (bounty-id uint)
+        (amount uint)
+    )
+    (let (
+            (current-pool (get-bounty-matching-pool bounty-id))
+            (new-remaining (- (get total-remaining current-pool) amount))
+        )
+        (asserts! (>= (get total-remaining current-pool) amount)
+            (err ERR-INSUFFICIENT-MATCHING-FUNDS)
+        )
+        (map-set bounty-total-matches bounty-id {
+            total-pledged: (get total-pledged current-pool),
+            total-remaining: new-remaining,
         })
         (ok true)
     )
