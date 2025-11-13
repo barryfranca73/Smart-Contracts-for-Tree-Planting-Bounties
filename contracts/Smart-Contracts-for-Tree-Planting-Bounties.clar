@@ -657,3 +657,29 @@
         (ok true)
     )
 )
+
+(define-public (force-close-expired-bounty (bounty-id uint))
+    (let (
+            (bounty (unwrap! (map-get? bounties bounty-id) (err ERR-BOUNTY-NOT-FOUND)))
+            (remaining (get remaining-reward bounty))
+        )
+        (begin
+            (asserts! (get active bounty) (err ERR-INVALID-BOUNTY))
+            (asserts! (>= burn-block-height (get expiry bounty))
+                (err ERR-INVALID-BOUNTY)
+            )
+            (match (stx-transfer? remaining (as-contract tx-sender) (get creator bounty))
+                success (begin
+                    (map-set bounties bounty-id
+                        (merge bounty {
+                            active: false,
+                            remaining-reward: u0,
+                        })
+                    )
+                    (ok true)
+                )
+                error (err ERR-INSUFFICIENT-FUNDS)
+            )
+        )
+    )
+)
